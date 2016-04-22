@@ -1,22 +1,25 @@
 package com.sambram.monitor.resources;
 
-import java.io.BufferedInputStream;
 import java.io.IOException;
 import java.io.InputStream;
 import java.util.HashMap;
+import java.util.List;
 import java.util.Map;
 import java.util.concurrent.atomic.AtomicLong;
 
 import javax.servlet.http.HttpServletResponse;
 
+import org.apache.commons.io.FilenameUtils;
+import org.apache.commons.io.IOUtils;
+import org.apache.commons.lang3.StringUtils;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.beans.factory.annotation.Autowired;
-import org.springframework.scheduling.annotation.Async;
+import org.springframework.beans.factory.annotation.Value;
 import org.springframework.stereotype.Controller;
-import org.springframework.util.FileCopyUtils;
 import org.springframework.web.bind.annotation.PathVariable;
 import org.springframework.web.bind.annotation.RequestMapping;
+import org.springframework.web.bind.annotation.RequestMethod;
 import org.springframework.web.bind.annotation.RequestParam;
 import org.springframework.web.bind.annotation.ResponseBody;
 import org.springframework.web.servlet.mvc.method.annotation.SseEmitter;
@@ -44,6 +47,11 @@ public class TestController {
     @Autowired
     RemoteCommandUtil remoteCommandUtil;
     
+    @Value("${remote.system.monitor.command}")
+    private String JAVA_MONITOR_COMMAND;
+    
+    @Value("${remote.system.pid.command}")
+    private String GET_PID_COMMAND;
     
     private static final String template = "Hello, %s!";
     private final AtomicLong counter = new AtomicLong();
@@ -98,14 +106,13 @@ public class TestController {
     
     @RequestMapping("/downloadlogs")
     public void downloadLogs(HttpServletResponse response, @RequestParam("server") String server, @RequestParam("logPath") String logPath) throws SftpException, JSchException, IOException {
-       String fileName = "test.log";
+       String fileName = FilenameUtils.getName(logPath);
         response.setContentType("text/plain");
         response.setHeader("Content-Disposition", String.format("attachment; filename=\"%s\"", fileName));
         InputStream fileStream = remoteCommandUtil.getFile(server, logPath);
-        InputStream inputStream = new BufferedInputStream(fileStream);
         
         //Copy bytes from source to destination(outputstream in this example), closes both streams.
-        FileCopyUtils.copy(inputStream, response.getOutputStream());
+        IOUtils.copy(fileStream, response.getOutputStream());
         response.flushBuffer();
     }
     
@@ -115,39 +122,43 @@ public class TestController {
        return "success";
     }
     
+    @RequestMapping("/monitor")
+    public @ResponseBody String monitorProcess(@RequestParam("server") String server, @RequestParam("service") String service) throws SftpException, JSchException, IOException, JsonException {
+       
+        List<String> pid = remoteCommandUtil.executeCommand(server, StringUtils.replace(GET_PID_COMMAND, "<service-name>", service));
+        List<String> executeCommand = remoteCommandUtil.executeCommand(server, StringUtils.replace(JAVA_MONITOR_COMMAND, "<pid>", pid.get(0)));
+       return JsonConverterUtil.objectToJson(executeCommand);
+       
+    }
+    
     @RequestMapping("/taillogs")
     public SseEmitter tailLogs(@RequestParam("server") String server, @RequestParam("logPath") String logPath) throws SftpException, JSchException, IOException {
         LOG.info("Tail logs for {}_{}", server, logPath);
         SseEmitter sseEmitter = new SseEmitter();
         logEmitterMap.put(server+"_"+logPath, sseEmitter);
-        emitResponse(sseEmitter);
+        emitResponse(server, logPath, sseEmitter);
         return sseEmitter;
     }
     
-    @Async
-    public void emitResponse(SseEmitter emitter) throws IOException {
-        Boolean complete = false;
-        Integer runCounter = 0;
-        while (!complete) {
-            runCounter ++;
-            LOG.info("Sending response to emitter");
-            try {
-                emitter.send("Response-" + counter.incrementAndGet());
-            } catch (Exception e) {
-                LOG.warn("Emitter not open", e);
-                complete = true;
-            }
-            if(runCounter == 500) {
-                emitter.complete();
-                complete = true;
-            }
+    private void emitResponse(String server, String logPath, SseEmitter emitter) throws IOException {
+        try {
+            remoteCommandUtil.tailLog(server, logPath, emitter);
+        } catch (JSchException e) {
+            LOG.error("Error getting logs");
+            tailLogsStop(server, logPath);
         }
     }
     
     @RequestMapping("/taillogs/stop")
-    public @ResponseBody String tailLogsStop(@RequestParam("server") String server, @RequestParam("logPath") String logPath) throws SftpException, JSchException, IOException {
-        SseEmitter sseEmitter = logEmitterMap.get(server+"_"+logPath);
-        sseEmitter.complete();
+    public @ResponseBody String tailLogsStop(@RequestParam("server") String server, @RequestParam("logPath") String logPath) {
+        LOG.info("Stop Tail logs for {}_{}", server, logPath);
+        String key = server + "_" + logPath;
+        if (logEmitterMap.containsKey(key)) {
+            SseEmitter sseEmitter = logEmitterMap.get(key);
+            sseEmitter.complete();
+            logEmitterMap.remove(key);
+        }
         return "Stopped";
     }
+    
 }
